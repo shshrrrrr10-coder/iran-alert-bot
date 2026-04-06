@@ -1,0 +1,39 @@
+name: Iran Launch Monitor
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  check-launches:
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Restore seen events cache
+        uses: actions/cache/restore@v4
+        with:
+          path: seen_events.json
+          key: seen-events-dummy
+          restore-keys: |
+            seen-events-
+
+      - name: Run monitor check (loops for ~5 minutes)
+        run: python monitor_check.py
+
+      - name: Save seen events cache
+        uses: actions/cache/save@v4
+        with:
+          path: seen_events.json
+          key: seen-events-${{ github.run_id }}
