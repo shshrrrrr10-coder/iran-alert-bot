@@ -96,6 +96,14 @@ def is_iran_launch(event):
             if keyword.lower() in combined.lower():
                 return True, f"News/Social: {keyword} detected"
 
+    # Check pre_warning events
+    if event_type == 'pre_warning':
+        text = properties.get('text', '')
+        source = properties.get('source', '')
+        combined = f"{text} {source}"
+        if '\u05d0\u05d9\u05e8\u05d0\u05df' in combined or 'Iran' in combined or 'iran' in combined:
+            return True, f"Pre-warning event: {text[:100]}"
+
     return False, ""
 
 
