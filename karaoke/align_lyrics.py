@@ -121,12 +121,60 @@ def align_evenly(lines, window_start, window_end):
     result, cursor = [], window_start
     for text, w in zip(lines, weights):
         end = cursor + span * w / total
-        result.append({"start": round(cursor, 3), "end": round(end, 3), "text": text})
+        words = text.split()
+        ww = [line_weight(x) for x in words]
+        total_ww, acc, word_times = sum(ww), 0.0, []
+        for word, weight in zip(words, ww):
+            ws = cursor + (end - cursor) * acc / total_ww
+            acc += weight
+            word_times.append({"start": round(ws, 3),
+                               "end": round(cursor + (end - cursor) * acc / total_ww, 3),
+                               "text": word})
+        result.append({"start": round(cursor, 3), "end": round(end, 3),
+                       "text": text, "words": word_times})
         cursor = end
     return result
 
 
+def words_within(text, start, end):
+    """Lay a line's words out inside one sung phrase, by character count."""
+    words = text.split()
+    weights = [line_weight(w) for w in words]
+    total, acc, out = sum(weights), 0.0, []
+    for word, weight in zip(words, weights):
+        ws = start + (end - start) * acc / total
+        acc += weight
+        out.append({"start": round(ws, 3),
+                    "end": round(start + (end - start) * acc / total, 3),
+                    "text": word})
+    return out
+
+
+def align_one_to_one(lines, segments):
+    """Exact case: one detected phrase per lyric line.
+
+    Each line takes its own phrase, so the highlight sweeps that phrase
+    and nothing else. The line stays on screen until the next one
+    starts -- singers still want to read it through the breath -- but
+    the sweep finishes with the singing rather than crawling on through
+    the pause.
+    """
+    result = []
+    for i, (text, (seg_start, seg_end)) in enumerate(zip(lines, segments)):
+        display_end = segments[i + 1][0] if i + 1 < len(segments) else seg_end
+        result.append({
+            "start": round(seg_start, 3),
+            "end": round(max(display_end, seg_end), 3),
+            "text": text,
+            "words": words_within(text, seg_start, seg_end),
+        })
+    return result
+
+
 def align(lines, segments, snap_tolerance=0.45):
+    if len(segments) == len(lines):
+        return align_one_to_one(lines, segments)
+
     offsets, total_active = build_active_map(segments)
     if total_active <= 0:
         sys.exit("No vocal activity detected in the selected window.")
@@ -155,7 +203,29 @@ def align(lines, segments, snap_tolerance=0.45):
         w_end = snap(w_end, offsets_ends, snap_tolerance)
         if w_end <= w_start:
             w_end = w_start + 0.4
-        result.append({"start": round(w_start, 3), "end": round(w_end, 3), "text": text})
+
+        # Per-word times, warped through the active timeline so a breath
+        # inside the line costs the words no time. Without these the
+        # renderer can only spread the highlight evenly across the line's
+        # whole span -- including its trailing pause -- so the sweep runs
+        # slow and drifts further behind the singing with every word.
+        words = text.split()
+        word_weights = [line_weight(w) for w in words]
+        total_ww = sum(word_weights)
+        word_times, acc = [], 0.0
+        for w in word_weights:
+            ws = a_start + (a_end - a_start) * acc / total_ww
+            acc += w
+            we = a_start + (a_end - a_start) * acc / total_ww
+            word_times.append({
+                "start": round(active_to_wall(ws, segments, offsets), 3),
+                "end": round(active_to_wall(max(we - 1e-6, ws), segments, offsets), 3),
+            })
+        for w, t in zip(words, word_times):
+            t["text"] = w
+
+        result.append({"start": round(w_start, 3), "end": round(w_end, 3),
+                       "text": text, "words": word_times})
 
     # Keep lines strictly ordered and non-overlapping.
     for i in range(len(result) - 1):
@@ -217,6 +287,9 @@ def main():
         for i, line in enumerate(aligned):
             earliest = aligned[i - 1]["end"] if i else 0.0
             line["start"] = round(max(earliest, line["start"] - args.lead), 3)
+            for word in line.get("words", []):
+                word["start"] = round(max(earliest, word["start"] - args.lead), 3)
+                word["end"] = round(max(word["start"] + 0.05, word["end"] - args.lead), 3)
 
     data = {"audio_file": vocal_path.name, "duration": duration, "lines": aligned}
     Path(args.out).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

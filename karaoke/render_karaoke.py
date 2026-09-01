@@ -22,8 +22,15 @@ from PIL import ImageFont
 
 def load_json_timing(path):
     data = json.loads(Path(path).read_text(encoding="utf-8"))
-    lines = data.get("lines", [])
-    return [(float(l["start"]), float(l["end"]), l["text"]) for l in lines]
+    entries = []
+    for l in data.get("lines", []):
+        entries.append({
+            "start": float(l["start"]),
+            "end": float(l["end"]),
+            "text": l["text"],
+            "words": l.get("words"),
+        })
+    return entries
 
 
 LRC_TAG_RE = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
@@ -45,7 +52,7 @@ def load_lrc_timing(path):
     result = []
     for i, (start, text) in enumerate(entries):
         end = entries[i + 1][0] if i + 1 < len(entries) else start + 4.0
-        result.append((start, end, text))
+        result.append({"start": start, "end": end, "text": text, "words": None})
     return result
 
 
@@ -128,15 +135,24 @@ def split_durations(words, total_ms):
     return ms
 
 
-def karaoke_sweep(text, duration_ms, measurer, width, height, fontsize, margin):
+def karaoke_sweep(entry, measurer, width, height, fontsize, margin):
     """Build the override tags that wipe the highlight across one line.
 
     Returns (tags, fontsize_used). The sweep is chained word by word:
     each \\t segment moves the clip edge across exactly one word during
-    exactly that word's share of the line, so the highlight starts on
-    the first syllable and lands on the last one on time.
-    Hebrew reads right to left, so the sweep runs right to left too.
+    exactly that word's own time, so the highlight starts on the first
+    syllable and lands on the last one on time. Hebrew reads right to
+    left, so the sweep runs right to left too.
+
+    When the timing file carries per-word times these are used directly,
+    which matters because a line's span usually runs on past the singing
+    into a breath before the next line. Spreading the sweep evenly over
+    that whole span makes it crawl and fall progressively behind the
+    voice. Real word times also leave gaps between the transforms, so
+    the highlight simply holds still through a mid-line breath.
     """
+    text = entry["text"]
+    start, end = entry["start"], entry["end"]
     words = text.split()
     size = fontsize
     line_w = measurer.width(text, size)
@@ -151,14 +167,23 @@ def karaoke_sweep(text, duration_ms, measurer, width, height, fontsize, margin):
     right_edge = centre + line_w / 2.0
     space_w = measurer.width(" ", size)
 
-    durations = split_durations(words, duration_ms)
+    word_times = entry.get("words")
+    if word_times and len(word_times) == len(words):
+        spans = [(max(0, round((w["start"] - start) * 1000)),
+                  max(1, round((w["end"] - start) * 1000))) for w in word_times]
+    else:
+        durations = split_durations(words, max(100, round((end - start) * 1000)))
+        spans, cursor_t = [], 0
+        for dur in durations:
+            spans.append((cursor_t, cursor_t + dur))
+            cursor_t += dur
+
     tags = [f"\\clip({right_edge:.0f},0,{width},{height})"]
     cursor_x = right_edge
-    cursor_t = 0
-    for word, dur in zip(words, durations):
+    for word, (t_start, t_end) in zip(words, spans):
         cursor_x -= measurer.width(word, size)
-        tags.append(f"\\t({cursor_t},{cursor_t + dur},\\clip({max(0.0, cursor_x):.0f},0,{width},{height}))")
-        cursor_t += dur
+        tags.append(f"\\t({t_start},{max(t_end, t_start + 1)},"
+                    f"\\clip({max(0.0, cursor_x):.0f},0,{width},{height}))")
         cursor_x -= space_w
     return "".join(tags), size
 
@@ -203,10 +228,10 @@ def build_ass(entries, width, height, font, fontsize, primary_color, secondary_c
         margin_current=int(height * 0.22), margin_next=int(height * 0.09),
     )
     events = []
-    for i, (start, end, text) in enumerate(entries):
-        duration_ms = max(100, round((end - start) * 1000))
-        safe_text = escape_ass_text(text)
-        sweep, size = karaoke_sweep(text, duration_ms, measurer, width, height, fontsize, margin)
+    for i, entry in enumerate(entries):
+        start, end = entry["start"], entry["end"]
+        safe_text = escape_ass_text(entry["text"])
+        sweep, size = karaoke_sweep(entry, measurer, width, height, fontsize, margin)
         resize = f"\\fs{size}" if size != fontsize else ""
 
         # Layer 0: dim base copy, always fully visible.
@@ -222,7 +247,7 @@ def build_ass(entries, width, height, font, fontsize, primary_color, secondary_c
         )
 
         if i + 1 < len(entries):
-            next_text = escape_ass_text(entries[i + 1][2])
+            next_text = escape_ass_text(entries[i + 1]["text"])
             events.append(
                 f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Next,,0,0,0,,{next_text}"
             )
@@ -283,7 +308,12 @@ def main():
 
     entries = load_timing(timing_path)
     if args.offset:
-        entries = [(s + args.offset, e + args.offset, t) for s, e, t in entries]
+        for entry in entries:
+            entry["start"] += args.offset
+            entry["end"] += args.offset
+            for word in entry.get("words") or []:
+                word["start"] += args.offset
+                word["end"] += args.offset
     if not entries:
         sys.exit("No timed lines found in timing file.")
 
