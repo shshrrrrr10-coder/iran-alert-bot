@@ -77,6 +77,23 @@ def line_weight(text):
     return max(1, len(text.replace(" ", "")))
 
 
+class OnsetIndex:
+    """Syllable attacks across the whole track, for snapping word edges."""
+
+    def __init__(self, vocal_path):
+        from analyze_structure import decode_audio
+        from onsets import onset_times
+
+        audio = decode_audio(vocal_path, 0, None)
+        self.times, self.strengths = onset_times(audio)
+
+    def place(self, priors, start, end, window):
+        from onsets import place_boundaries
+
+        mask = (self.times > start) & (self.times < end)
+        return place_boundaries(priors, self.times[mask], self.strengths[mask], window)
+
+
 def parse_lyrics_file(path):
     """Read a lyrics file, optionally split into timed sections.
 
@@ -136,21 +153,33 @@ def align_evenly(lines, window_start, window_end):
     return result
 
 
-def words_within(text, start, end):
-    """Lay a line's words out inside one sung phrase, by character count."""
+def words_within(text, start, end, onset_index=None, snap_window=0.35):
+    """Lay a line's words out inside one sung phrase.
+
+    Character count gives the first guess, then each internal boundary
+    is pulled onto a real syllable attack nearby. Without that snap a
+    held final syllable drags every earlier word later than it is sung.
+    """
     words = text.split()
     weights = [line_weight(w) for w in words]
-    total, acc, out = sum(weights), 0.0, []
-    for word, weight in zip(words, weights):
-        ws = start + (end - start) * acc / total
+    total = sum(weights)
+
+    priors, acc = [], 0.0
+    for weight in weights[:-1]:
         acc += weight
-        out.append({"start": round(ws, 3),
-                    "end": round(start + (end - start) * acc / total, 3),
-                    "text": word})
-    return out
+        priors.append(start + (end - start) * acc / total)
+
+    if onset_index is not None and priors:
+        boundaries = onset_index.place(priors, start, end, snap_window)
+    else:
+        boundaries = priors
+
+    edges = [start] + list(boundaries) + [end]
+    return [{"start": round(edges[i], 3), "end": round(edges[i + 1], 3), "text": w}
+            for i, w in enumerate(words)]
 
 
-def align_one_to_one(lines, segments):
+def align_one_to_one(lines, segments, onset_index=None):
     """Exact case: one detected phrase per lyric line.
 
     Each line takes its own phrase, so the highlight sweeps that phrase
@@ -166,14 +195,14 @@ def align_one_to_one(lines, segments):
             "start": round(seg_start, 3),
             "end": round(max(display_end, seg_end), 3),
             "text": text,
-            "words": words_within(text, seg_start, seg_end),
+            "words": words_within(text, seg_start, seg_end, onset_index),
         })
     return result
 
 
-def align(lines, segments, snap_tolerance=0.45):
+def align(lines, segments, snap_tolerance=0.45, onset_index=None):
     if len(segments) == len(lines):
-        return align_one_to_one(lines, segments)
+        return align_one_to_one(lines, segments, onset_index)
 
     offsets, total_active = build_active_map(segments)
     if total_active <= 0:
@@ -248,6 +277,9 @@ def main():
     parser.add_argument("--quiet-ratio", type=float, default=0.35,
                         help="If a section's vocal energy covers less than this fraction of its span, "
                              "space its lines evenly instead of by energy (default 0.35)")
+    parser.add_argument("--no-onsets", action="store_true",
+                        help="Space words inside a phrase by character count only, without snapping "
+                             "them to detected syllable attacks")
     parser.add_argument("--lead", type=float, default=0.15,
                         help="Start every line this many seconds early (default 0.15). Silence detection "
                              "marks a phrase where it crosses the threshold, slightly after the note "
@@ -265,6 +297,9 @@ def main():
     duration = ffprobe_duration(vocal_path)
     silences = detect_silence(vocal_path, args.noise_db, args.min_silence)
     all_segments = voice_segments(silences, duration, args.min_segment)
+    onset_index = None if args.no_onsets else OnsetIndex(vocal_path)
+    if onset_index is not None:
+        print(f"{len(onset_index.times)} syllable onsets detected across the track")
 
     aligned = []
     for section in sections:
@@ -282,7 +317,7 @@ def main():
               f"{len(segments):2d} phrases, {total_active:5.1f}s singing, "
               f"{len(section['lines'])} lines "
               f"({sum(line_weight(l) for l in section['lines']) / total_active:.1f} chars/s)")
-        aligned.extend(align(section["lines"], segments, args.snap))
+        aligned.extend(align(section["lines"], segments, args.snap, onset_index))
     if args.lead:
         for i, line in enumerate(aligned):
             earliest = aligned[i - 1]["end"] if i else 0.0
