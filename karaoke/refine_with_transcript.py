@@ -84,8 +84,20 @@ def main():
 
     print(f"applied {applied} corrections, rejected {rejected} as too large or out of order")
 
+    # Pulling a line earlier leaves the line before it ending too late, and
+    # two lines drawn at the same position at the same time overlap on
+    # screen. Close every window at the next line's start.
+    trimmed = 0
+    for i in range(len(lines) - 1):
+        if lines[i]["end"] > lines[i + 1]["start"]:
+            lines[i]["end"] = round(lines[i + 1]["start"], 3)
+            trimmed += 1
+    if trimmed:
+        print(f"trimmed {trimmed} line windows that would have overlapped on screen")
+
     starts = [l["start"] for l in lines]
     assert all(starts[i] <= starts[i + 1] for i in range(len(starts) - 1)), "line order broken"
+    assert all(lines[i]["end"] <= lines[i + 1]["start"] + 1e-6 for i in range(len(lines) - 1)), "windows overlap"
 
     Path(args.out).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Wrote {args.out}")

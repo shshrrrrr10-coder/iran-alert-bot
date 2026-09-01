@@ -135,7 +135,20 @@ def split_durations(words, total_ms):
     return ms
 
 
-def karaoke_sweep(entry, measurer, width, height, fontsize, margin):
+def close_overlaps(entries):
+    """Two lines drawn at the same place at the same time overlap on
+    screen, so each line's window ends where the next one opens."""
+    trimmed = 0
+    for i in range(len(entries) - 1):
+        if entries[i]["end"] > entries[i + 1]["start"]:
+            entries[i]["end"] = entries[i + 1]["start"]
+            trimmed += 1
+    if trimmed:
+        print(f"Closed {trimmed} overlapping line windows")
+    return entries
+
+
+def karaoke_sweep(entry, measurer, width, height, fontsize, margin, style="word", flip_ms=110):
     """Build the override tags that wipe the highlight across one line.
 
     Returns (tags, fontsize_used). The sweep is chained word by word:
@@ -182,8 +195,15 @@ def karaoke_sweep(entry, measurer, width, height, fontsize, margin):
     cursor_x = right_edge
     for word, (t_start, t_end) in zip(words, spans):
         cursor_x -= measurer.width(word, size)
-        tags.append(f"\\t({t_start},{max(t_end, t_start + 1)},"
-                    f"\\clip({max(0.0, cursor_x):.0f},0,{width},{height}))")
+        edge = max(0.0, cursor_x)
+        if style == "word":
+            # The whole word turns colour as it is reached. A wipe that
+            # creeps across a word for its full second reads as sluggish
+            # however exact its timing is; a flip lands on the beat.
+            finish = t_start + flip_ms
+        else:
+            finish = max(t_end, t_start + 1)
+        tags.append(f"\\t({t_start},{finish},\\clip({edge:.0f},0,{width},{height}))")
         cursor_x -= space_w
     return "".join(tags), size
 
@@ -205,7 +225,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
 
-def build_ass(entries, width, height, font, fontsize, primary_color, secondary_color):
+def build_ass(entries, width, height, font, fontsize, primary_color, secondary_color,
+              style="word", flip_ms=110):
     """Build the .ass subtitle.
 
     Each lyric line is drawn TWICE at the identical position: once dim
@@ -231,7 +252,7 @@ def build_ass(entries, width, height, font, fontsize, primary_color, secondary_c
     for i, entry in enumerate(entries):
         start, end = entry["start"], entry["end"]
         safe_text = escape_ass_text(entry["text"])
-        sweep, size = karaoke_sweep(entry, measurer, width, height, fontsize, margin)
+        sweep, size = karaoke_sweep(entry, measurer, width, height, fontsize, margin, style, flip_ms)
         resize = f"\\fs{size}" if size != fontsize else ""
 
         # Layer 0: dim base copy, always fully visible.
@@ -294,6 +315,11 @@ def main():
     parser.add_argument("--primary-color", default="&H0000D7FF", help="ASS &HAABBGGRR color for the active/highlighted word (default gold)")
     parser.add_argument("--secondary-color", default="&H00FFFFFF", help="ASS &HAABBGGRR color for not-yet-sung words (default white)")
     parser.add_argument("--offset", type=float, default=0.0, help="Shift all timings by N seconds (+ delay, - earlier)")
+    parser.add_argument("--style", default="word", choices=["word", "wipe"],
+                        help="'word' flips each word to the highlight colour as it is sung (default); "
+                             "'wipe' sweeps the colour across each word over its full duration")
+    parser.add_argument("--flip-ms", type=int, default=110,
+                        help="How fast a word flips colour in 'word' style (default 110ms)")
     parser.add_argument("--keep-ass", action="store_true", help="Keep the generated .ass subtitle file next to the output")
     args = parser.parse_args()
 
@@ -316,13 +342,14 @@ def main():
                 word["end"] += args.offset
     if not entries:
         sys.exit("No timed lines found in timing file.")
+    close_overlaps(entries)
 
     duration = ffprobe_duration(audio_path)
     print(f"Audio duration: {duration:.2f}s, {len(entries)} lyric lines")
 
     ass_content = build_ass(
         entries, args.width, args.height, args.font, args.fontsize,
-        args.primary_color, args.secondary_color,
+        args.primary_color, args.secondary_color, args.style, args.flip_ms,
     )
 
     if args.keep_ass:
