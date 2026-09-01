@@ -73,30 +73,15 @@ def ass_time(t):
     return f"{h}:{m:02d}:{s:05.2f}"
 
 
-def split_words_karaoke(text, duration_s):
-    """Distribute a line's duration across its words proportionally to
-    character length, producing ASS \\k tags (centiseconds per word)."""
-    words = text.split()
-    if not words:
-        return text
-    total_cs = max(1, round(duration_s * 100))
-    weights = [max(1, len(w)) for w in words]
-    total_w = sum(weights)
-    raw = [w * total_cs / total_w for w in weights]
-    cs = [int(r) for r in raw]
-    remainder = total_cs - sum(cs)
-    # largest-remainder method so the total matches exactly
-    order = sorted(range(len(raw)), key=lambda i: raw[i] - cs[i], reverse=True)
-    for i in range(remainder):
-        cs[order[i % len(order)]] += 1
-    parts = []
-    for word, c in zip(words, cs):
-        parts.append(f"{{\\k{c}}}{escape_ass_text(word)}")
-    return " ".join(parts)
-
-
 def escape_ass_text(text):
     return text.replace("{", r"\{").replace("}", r"\}")
+
+
+def inline_color(aabbggrr):
+    """Convert a style-style &HAABBGGRR colour into the &HBBGGRR&
+    form used by inline \\c override tags (drops the alpha byte)."""
+    hexpart = aabbggrr.replace("&H", "").replace("&", "")
+    return "&H" + hexpart[-6:] + "&"
 
 
 ASS_HEADER = """[Script Info]
@@ -117,19 +102,43 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 def build_ass(entries, width, height, font, fontsize, primary_color, secondary_color):
-    fontsize_next = max(20, int(fontsize * 0.6))
+    """Build the .ass subtitle.
+
+    Each lyric line is drawn TWICE at the identical position: once dim
+    (Layer 0, plain text) and once in the highlight colour (Layer 1,
+    same plain text) revealed by an animated \\clip rectangle that
+    shrinks in from the right edge of the frame over the line's
+    duration. Because both copies are single, unbroken text runs (no
+    override tags splitting the run), libass's RTL/bidi reordering
+    applies correctly to the whole line -- unlike per-word \\k tags,
+    which split the line into multiple runs and are NOT bidi-reordered
+    by libass, making the highlight (and even the words themselves)
+    come out in the wrong, left-to-right order for Hebrew.
+    """
+    highlight_inline = inline_color(primary_color)
     header = ASS_HEADER.format(
         width=width, height=height, font=font, fontsize=fontsize,
-        fontsize_next=fontsize_next, primary=primary_color, secondary=secondary_color,
+        fontsize_next=max(20, int(fontsize * 0.6)), primary=secondary_color, secondary=secondary_color,
         margin_current=int(height * 0.22), margin_next=int(height * 0.09),
     )
     events = []
     for i, (start, end, text) in enumerate(entries):
-        duration = max(0.1, end - start)
-        karaoke_text = split_words_karaoke(text, duration)
+        duration_ms = max(100, round((end - start) * 1000))
+        safe_text = escape_ass_text(text)
+
+        # Layer 0: dim base copy, always fully visible.
         events.append(
-            f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Current,,0,0,0,,{karaoke_text}"
+            f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Current,,0,0,0,,{safe_text}"
         )
+        # Layer 1: highlight copy, revealed right-to-left via animated clip.
+        clip_tag = (
+            f"{{\\c{highlight_inline}\\clip({width},0,{width},{height})"
+            f"\\t(0,{duration_ms},\\clip(0,0,{width},{height}))}}"
+        )
+        events.append(
+            f"Dialogue: 1,{ass_time(start)},{ass_time(end)},Current,,0,0,0,,{clip_tag}{safe_text}"
+        )
+
         if i + 1 < len(entries):
             next_text = escape_ass_text(entries[i + 1][2])
             events.append(
