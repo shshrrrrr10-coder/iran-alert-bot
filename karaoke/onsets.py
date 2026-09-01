@@ -34,21 +34,50 @@ def spectral_flux(audio):
     return np.maximum(flux - baseline, 0)
 
 
-def onset_times(audio, offset=0.0):
-    """Return (times, strengths) of onset peaks, times offset into the track."""
+def onset_times(audio, offset=0.0, local_max_ms=60, mean_ms=300,
+                delta_factor=0.55, min_gap_ms=130):
+    """Return (times, strengths) of syllable attacks.
+
+    Naive three-point peak picking on spectral flux finds a peak every
+    few frames -- around 21 per second on sung Hebrew, against the 3-6
+    syllables per second actually being sung. Snapping word boundaries
+    to that is snapping to noise. So a peak must additionally dominate
+    its neighbourhood, stand above a local adaptive threshold, and keep
+    a minimum distance from the previous onset.
+    """
     flux = spectral_flux(audio)
-    if len(flux) < 3:
+    if len(flux) < 5:
         return np.zeros(0), np.zeros(0)
-    peaks = []
-    for i in range(1, len(flux) - 1):
-        if flux[i] >= flux[i - 1] and flux[i] > flux[i + 1] and flux[i] > 0:
-            peaks.append(i)
-    if not peaks:
-        return np.zeros(0), np.zeros(0)
-    peaks = np.array(peaks)
-    strengths = flux[peaks]
-    times = offset + (peaks + 1) * HOP / SR
-    return times, strengths
+
+    frame_ms = HOP / SR * 1000.0
+    half = max(1, int(local_max_ms / frame_ms / 2))
+    mean_half = max(2, int(mean_ms / frame_ms / 2))
+    min_gap = max(1, int(min_gap_ms / frame_ms))
+
+    # Local mean as an adaptive floor, so a quiet passage still yields
+    # onsets and a loud one does not yield a forest of them.
+    kernel = np.ones(2 * mean_half + 1, dtype=np.float32) / (2 * mean_half + 1)
+    local_mean = np.convolve(flux, kernel, mode="same")
+    threshold = local_mean + delta_factor * flux.std()
+
+    times, strengths, last = [], [], -min_gap
+    for i in range(half, len(flux) - half):
+        value = flux[i]
+        if value < threshold[i]:
+            continue
+        if value < flux[i - half:i + half + 1].max():
+            continue
+        if i - last < min_gap:
+            # Keep whichever of the two is stronger.
+            if strengths and value > strengths[-1]:
+                times[-1] = offset + (i + 1) * HOP / SR
+                strengths[-1] = value
+                last = i
+            continue
+        times.append(offset + (i + 1) * HOP / SR)
+        strengths.append(value)
+        last = i
+    return np.array(times), np.array(strengths)
 
 
 def place_boundaries(priors, times, strengths, window, min_gap=0.12):

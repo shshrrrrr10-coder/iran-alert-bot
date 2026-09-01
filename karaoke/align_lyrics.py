@@ -87,6 +87,9 @@ class OnsetIndex:
         audio = decode_audio(vocal_path, 0, None)
         self.times, self.strengths = onset_times(audio)
 
+    def between(self, start, end):
+        return self.times[(self.times > start) & (self.times < end)]
+
     def place(self, priors, start, end, window):
         from onsets import place_boundaries
 
@@ -169,10 +172,26 @@ def words_within(text, start, end, onset_index=None, snap_window=0.35):
         acc += weight
         priors.append(start + (end - start) * acc / total)
 
+    boundaries = priors
     if onset_index is not None and priors:
-        boundaries = onset_index.place(priors, start, end, snap_window)
-    else:
-        boundaries = priors
+        attacks = onset_index.between(start, end)
+        if len(attacks) >= len(words):
+            # Divide the phrase by its syllable attacks rather than by the
+            # clock. A held final syllable produces no new attacks, so it
+            # no longer steals time from the words before it -- which is
+            # what pushed the highlight behind the voice.
+            boundaries, acc = [], 0.0
+            for weight in weights[:-1]:
+                acc += weight
+                position = int(round(len(attacks) * acc / total))
+                position = min(max(position, 1), len(attacks) - 1)
+                boundaries.append(float(attacks[position]))
+            boundaries = sorted(set(boundaries))
+            while len(boundaries) < len(words) - 1:
+                boundaries.append(priors[len(boundaries)])
+            boundaries = sorted(boundaries)[:len(words) - 1]
+        else:
+            boundaries = onset_index.place(priors, start, end, snap_window)
 
     edges = [start] + list(boundaries) + [end]
     return [{"start": round(edges[i], 3), "end": round(edges[i + 1], 3), "text": w}
