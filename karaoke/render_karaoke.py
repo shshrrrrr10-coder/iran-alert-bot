@@ -17,6 +17,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from PIL import ImageFont
+
 
 def load_json_timing(path):
     data = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -84,6 +86,83 @@ def inline_color(aabbggrr):
     return "&H" + hexpart[-6:] + "&"
 
 
+def resolve_font_file(family, bold=True):
+    query = f"{family}:bold" if bold else family
+    out = subprocess.run(["fc-match", query, "-f", "%{file}"], capture_output=True, text=True)
+    path = out.stdout.strip()
+    if not path:
+        sys.exit(f"Could not resolve a font file for '{family}'. Install it, or pass --font with an installed family.")
+    return path
+
+
+class TextMeasurer:
+    """Measures rendered text width so the highlight sweep can track the
+    glyphs themselves. Without this the sweep has to cross the whole
+    frame, wasting the start and end of every line on empty margins --
+    which reads as a highlight that lags the singing and crawls."""
+
+    def __init__(self, font_file):
+        self.font_file = font_file
+        self._cache = {}
+
+    def font(self, size):
+        size = max(1, int(round(size)))
+        if size not in self._cache:
+            self._cache[size] = ImageFont.truetype(self.font_file, size)
+        return self._cache[size]
+
+    def width(self, text, size):
+        return float(self.font(size).getlength(text))
+
+
+def split_durations(words, total_ms):
+    """Give each word a share of the line proportional to its length."""
+    weights = [max(1, len(w)) for w in words]
+    total_w = sum(weights)
+    raw = [w * total_ms / total_w for w in weights]
+    ms = [int(r) for r in raw]
+    remainder = total_ms - sum(ms)
+    order = sorted(range(len(raw)), key=lambda i: raw[i] - ms[i], reverse=True)
+    for i in range(remainder):
+        ms[order[i % len(order)]] += 1
+    return ms
+
+
+def karaoke_sweep(text, duration_ms, measurer, width, height, fontsize, margin):
+    """Build the override tags that wipe the highlight across one line.
+
+    Returns (tags, fontsize_used). The sweep is chained word by word:
+    each \\t segment moves the clip edge across exactly one word during
+    exactly that word's share of the line, so the highlight starts on
+    the first syllable and lands on the last one on time.
+    Hebrew reads right to left, so the sweep runs right to left too.
+    """
+    words = text.split()
+    size = fontsize
+    line_w = measurer.width(text, size)
+    available = width - 2 * margin
+    if line_w > available:
+        # Shrink rather than let libass wrap: a wrapped line would break
+        # the single-row geometry this sweep depends on.
+        size = max(12, int(fontsize * available / line_w))
+        line_w = measurer.width(text, size)
+
+    centre = width / 2.0
+    right_edge = centre + line_w / 2.0
+    space_w = measurer.width(" ", size)
+
+    durations = split_durations(words, duration_ms)
+    tags = [f"\\clip({right_edge:.0f},0,{width},{height})"]
+    cursor_x = right_edge
+    cursor_t = 0
+    for word, dur in zip(words, durations):
+        cursor_x -= measurer.width(word, size)
+        tags.append(f"\\t({cursor_t},{cursor_t + dur},\\clip({max(0.0, cursor_x):.0f},0,{width},{height}))")
+        cursor_t += dur
+        cursor_x -= space_w
+    return "".join(tags), size
+
+
 ASS_HEADER = """[Script Info]
 ScriptType: v4.00+
 PlayResX: {width}
@@ -116,6 +195,8 @@ def build_ass(entries, width, height, font, fontsize, primary_color, secondary_c
     come out in the wrong, left-to-right order for Hebrew.
     """
     highlight_inline = inline_color(primary_color)
+    margin = 60
+    measurer = TextMeasurer(resolve_font_file(font, bold=True))
     header = ASS_HEADER.format(
         width=width, height=height, font=font, fontsize=fontsize,
         fontsize_next=max(20, int(fontsize * 0.6)), primary=secondary_color, secondary=secondary_color,
@@ -125,18 +206,19 @@ def build_ass(entries, width, height, font, fontsize, primary_color, secondary_c
     for i, (start, end, text) in enumerate(entries):
         duration_ms = max(100, round((end - start) * 1000))
         safe_text = escape_ass_text(text)
+        sweep, size = karaoke_sweep(text, duration_ms, measurer, width, height, fontsize, margin)
+        resize = f"\\fs{size}" if size != fontsize else ""
 
         # Layer 0: dim base copy, always fully visible.
         events.append(
+            f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Current,,0,0,0,,{{{resize}}}{safe_text}"
+            if resize else
             f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Current,,0,0,0,,{safe_text}"
         )
-        # Layer 1: highlight copy, revealed right-to-left via animated clip.
-        clip_tag = (
-            f"{{\\c{highlight_inline}\\clip({width},0,{width},{height})"
-            f"\\t(0,{duration_ms},\\clip(0,0,{width},{height}))}}"
-        )
+        # Layer 1: highlight copy, wiped in right-to-left across the words.
         events.append(
-            f"Dialogue: 1,{ass_time(start)},{ass_time(end)},Current,,0,0,0,,{clip_tag}{safe_text}"
+            f"Dialogue: 1,{ass_time(start)},{ass_time(end)},Current,,0,0,0,,"
+            f"{{\\c{highlight_inline}{resize}{sweep}}}{safe_text}"
         )
 
         if i + 1 < len(entries):

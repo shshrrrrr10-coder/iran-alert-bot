@@ -178,6 +178,10 @@ def main():
     parser.add_argument("--quiet-ratio", type=float, default=0.35,
                         help="If a section's vocal energy covers less than this fraction of its span, "
                              "space its lines evenly instead of by energy (default 0.35)")
+    parser.add_argument("--lead", type=float, default=0.15,
+                        help="Start every line this many seconds early (default 0.15). Silence detection "
+                             "marks a phrase where it crosses the threshold, slightly after the note "
+                             "starts, and a singer needs to see a word just before singing it.")
     args = parser.parse_args()
 
     vocal_path = Path(args.vocal)
@@ -209,6 +213,11 @@ def main():
               f"{len(section['lines'])} lines "
               f"({sum(line_weight(l) for l in section['lines']) / total_active:.1f} chars/s)")
         aligned.extend(align(section["lines"], segments, args.snap))
+    if args.lead:
+        for i, line in enumerate(aligned):
+            earliest = aligned[i - 1]["end"] if i else 0.0
+            line["start"] = round(max(earliest, line["start"] - args.lead), 3)
+
     data = {"audio_file": vocal_path.name, "duration": duration, "lines": aligned}
     Path(args.out).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Wrote {args.out}")
