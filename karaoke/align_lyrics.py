@@ -77,6 +77,55 @@ def line_weight(text):
     return max(1, len(text.replace(" ", "")))
 
 
+def parse_lyrics_file(path):
+    """Read a lyrics file, optionally split into timed sections.
+
+    A line of the form '# <start> <end>' opens a section: every lyric
+    line after it is aligned only within that time window. This keeps a
+    verse from drifting into the next one across an instrumental break,
+    and lets a repeated chorus be pinned to each of its returns.
+    Without any '#' markers the whole file is aligned as one block.
+    """
+    sections = []
+    current = None
+    for raw in Path(path).read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            parts = line[1:].split()
+            if len(parts) < 2:
+                continue  # a plain comment
+            current = {"start": float(parts[0]), "end": float(parts[1]), "lines": []}
+            sections.append(current)
+            continue
+        if current is None:
+            current = {"start": None, "end": None, "lines": []}
+            sections.append(current)
+        current["lines"].append(line)
+    return [s for s in sections if s["lines"]]
+
+
+def align_evenly(lines, window_start, window_end):
+    """Spread lines across a window purely by character count.
+
+    Used where the vocal stem carries little energy but singing is
+    happening anyway -- a crowd singing along, a backing-vocal passage,
+    or a lead vocal buried by the separation. Energy-based alignment
+    would cram every line into the few loud moments; even spacing at
+    least keeps the lines marching through the section in order.
+    """
+    weights = [line_weight(l) for l in lines]
+    total = sum(weights)
+    span = max(0.5, window_end - window_start)
+    result, cursor = [], window_start
+    for text, w in zip(lines, weights):
+        end = cursor + span * w / total
+        result.append({"start": round(cursor, 3), "end": round(end, 3), "text": text})
+        cursor = end
+    return result
+
+
 def align(lines, segments, snap_tolerance=0.45):
     offsets, total_active = build_active_map(segments)
     if total_active <= 0:
@@ -126,28 +175,40 @@ def main():
     parser.add_argument("--min-silence", type=float, default=0.25)
     parser.add_argument("--min-segment", type=float, default=0.2)
     parser.add_argument("--snap", type=float, default=0.45, help="Snap line edges to a vocal onset within this many seconds")
+    parser.add_argument("--quiet-ratio", type=float, default=0.35,
+                        help="If a section's vocal energy covers less than this fraction of its span, "
+                             "space its lines evenly instead of by energy (default 0.35)")
     args = parser.parse_args()
 
     vocal_path = Path(args.vocal)
     if not vocal_path.exists():
         sys.exit(f"Vocal file not found: {vocal_path}")
 
-    lines = [l.strip() for l in Path(args.lyrics).read_text(encoding="utf-8").splitlines() if l.strip()]
-    if not lines:
+    sections = parse_lyrics_file(args.lyrics)
+    if not sections:
         sys.exit("Lyrics file is empty.")
 
     duration = ffprobe_duration(vocal_path)
-    window_end = args.end if args.end is not None else duration
     silences = detect_silence(vocal_path, args.noise_db, args.min_silence)
-    segments = voice_segments(silences, duration, args.min_segment)
-    segments = clip_segments(segments, args.start, window_end)
+    all_segments = voice_segments(silences, duration, args.min_segment)
 
-    _, total_active = build_active_map(segments)
-    print(f"Window {args.start:.1f}s -> {window_end:.1f}s")
-    print(f"{len(segments)} vocal segments, {total_active:.1f}s of actual singing")
-    print(f"{len(lines)} lyric lines -> {sum(line_weight(l) for l in lines) / total_active:.1f} characters per second of singing")
-
-    aligned = align(lines, segments, args.snap)
+    aligned = []
+    for section in sections:
+        sec_start = section["start"] if section["start"] is not None else args.start
+        sec_end = section["end"] if section["end"] is not None else (args.end if args.end is not None else duration)
+        segments = clip_segments(all_segments, sec_start, sec_end)
+        _, total_active = build_active_map(segments)
+        span = sec_end - sec_start
+        if total_active < args.quiet_ratio * span:
+            print(f"\nSection {sec_start:7.1f}s -> {sec_end:7.1f}s : only {total_active:.1f}s of "
+                  f"{span:.1f}s carries vocal energy -- spacing {len(section['lines'])} lines evenly instead")
+            aligned.extend(align_evenly(section["lines"], sec_start, sec_end))
+            continue
+        print(f"\nSection {sec_start:7.1f}s -> {sec_end:7.1f}s : "
+              f"{len(segments):2d} phrases, {total_active:5.1f}s singing, "
+              f"{len(section['lines'])} lines "
+              f"({sum(line_weight(l) for l in section['lines']) / total_active:.1f} chars/s)")
+        aligned.extend(align(section["lines"], segments, args.snap))
     data = {"audio_file": vocal_path.name, "duration": duration, "lines": aligned}
     Path(args.out).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Wrote {args.out}")
