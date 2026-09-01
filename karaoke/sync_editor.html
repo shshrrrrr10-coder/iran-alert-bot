@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<title>עורך סנכרון קריוקי</title>
+<style>
+  body { font-family: Arial, sans-serif; background:#111; color:#eee; margin:0; padding:20px; }
+  h1 { font-size: 20px; }
+  .panel { background:#1c1c1c; border-radius:8px; padding:16px; margin-bottom:16px; }
+  textarea { width:100%; height:160px; box-sizing:border-box; font-size:16px; direction:rtl; background:#000; color:#eee; border:1px solid #444; border-radius:4px; padding:8px; }
+  input[type=file] { color:#eee; }
+  button { background:#2d6cdf; color:#fff; border:none; border-radius:4px; padding:8px 14px; font-size:14px; cursor:pointer; margin-left:6px; }
+  button:hover { background:#1e54b7; }
+  button.secondary { background:#444; }
+  button.secondary:hover { background:#333; }
+  button:disabled { background:#333; color:#888; cursor:not-allowed; }
+  .row { display:flex; align-items:center; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
+  #status { font-size:15px; margin:10px 0; }
+  #current-line { font-size:28px; padding:14px; background:#000; border-radius:6px; text-align:center; min-height:40px; }
+  #next-line { font-size:16px; color:#888; text-align:center; margin-top:6px; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th, td { border-bottom:1px solid #333; padding:6px 8px; text-align:right; }
+  tr.done td { color:#8f8; }
+  tr.active td { background:#2a2a00; }
+  .hint { color:#999; font-size:13px; line-height:1.6; }
+  .time { font-variant-numeric: tabular-nums; }
+  #tap-btn { font-size:20px; padding:16px 40px; }
+</style>
+</head>
+<body>
+<h1>🎤 עורך סנכרון קריוקי (הקלדה בקצב)</h1>
+
+<div class="panel">
+  <div class="row">
+    <label>קובץ שמע (השיר ללא קול): </label>
+    <input type="file" id="audio-file" accept="audio/*">
+  </div>
+  <audio id="player" controls style="width:100%"></audio>
+  <div class="row" style="margin-top:10px">
+    <label>מהירות נגינה:</label>
+    <select id="rate">
+      <option value="1">רגיל (1x)</option>
+      <option value="0.75">איטי (0.75x)</option>
+      <option value="0.5">איטי מאוד (0.5x)</option>
+    </select>
+    <label style="margin-right:16px">היסט גלובלי (שניות, לתיקון זמן תגובה):</label>
+    <input type="number" id="offset" value="-0.15" step="0.05" style="width:70px">
+  </div>
+  <p class="hint">
+    1. טענו את קובץ השמע ואת מילות השיר (שורה אחת לכל שורת מילים).<br>
+    2. לחצו "התחל סנכרון" — השיר יתחיל לנגן.<br>
+    3. לחצו על "הקש כאן בקצב!" (או מקש רווח) בדיוק ברגע שמתחילה כל שורה.<br>
+    4. טעות? מקש Backspace / כפתור "חזרה שורה" מבטל את ההקשה האחרונה.<br>
+    5. בסיום כל השורות — ייצאו את קובץ התזמון (JSON) ותשתמשו בו עם render_karaoke.py.
+  </p>
+</div>
+
+<div class="panel">
+  <label>מילות השיר (שורה = יחידת קריוקי אחת):</label>
+  <textarea id="lyrics" placeholder="שורה ראשונה של השיר&#10;שורה שנייה&#10;..."></textarea>
+  <div class="row" style="margin-top:8px">
+    <button id="load-lines">טען שורות</button>
+    <span class="hint" id="line-count"></span>
+  </div>
+</div>
+
+<div class="panel" id="sync-panel" style="display:none">
+  <div class="row">
+    <button id="start-sync">התחל סנכרון</button>
+    <button id="pause-btn" class="secondary">השהה/המשך</button>
+    <button id="undo-btn" class="secondary">↩ חזרה שורה (Backspace)</button>
+    <span id="status" class="time"></span>
+  </div>
+  <div id="current-line" dir="rtl">—</div>
+  <div id="next-line" dir="rtl"></div>
+  <div class="row" style="justify-content:center; margin-top:14px">
+    <button id="tap-btn">⏺ הקש כאן בקצב! (רווח)</button>
+  </div>
+</div>
+
+<div class="panel" id="table-panel" style="display:none">
+  <div class="row">
+    <button id="export-json">⬇ ייצוא JSON לתזמון</button>
+    <button id="export-lrc" class="secondary">⬇ ייצוא LRC</button>
+  </div>
+  <table id="lines-table">
+    <thead><tr><th>#</th><th>התחלה</th><th>סיום</th><th>טקסט</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<script>
+const audioFileInput = document.getElementById('audio-file');
+const player = document.getElementById('player');
+const lyricsBox = document.getElementById('lyrics');
+const loadLinesBtn = document.getElementById('load-lines');
+const lineCountEl = document.getElementById('line-count');
+const syncPanel = document.getElementById('sync-panel');
+const tablePanel = document.getElementById('table-panel');
+const startSyncBtn = document.getElementById('start-sync');
+const pauseBtn = document.getElementById('pause-btn');
+const undoBtn = document.getElementById('undo-btn');
+const tapBtn = document.getElementById('tap-btn');
+const statusEl = document.getElementById('status');
+const currentLineEl = document.getElementById('current-line');
+const nextLineEl = document.getElementById('next-line');
+const linesTableBody = document.querySelector('#lines-table tbody');
+const rateSelect = document.getElementById('rate');
+const offsetInput = document.getElementById('offset');
+
+let lines = [];       // {text}
+let taps = [];        // start times, index-aligned with lines
+let audioFileName = 'song.mp3';
+let audioDuration = 0;
+
+audioFileInput.addEventListener('change', () => {
+  const f = audioFileInput.files[0];
+  if (!f) return;
+  audioFileName = f.name;
+  player.src = URL.createObjectURL(f);
+  player.load();
+});
+
+player.addEventListener('loadedmetadata', () => { audioDuration = player.duration; });
+
+loadLinesBtn.addEventListener('click', () => {
+  lines = lyricsBox.value.split('\n').map(s => s.trim()).filter(s => s.length > 0)
+            .map(text => ({ text }));
+  taps = [];
+  lineCountEl.textContent = `${lines.length} שורות נטענו.`;
+  syncPanel.style.display = lines.length ? 'block' : 'none';
+  tablePanel.style.display = 'none';
+  renderCurrentLine();
+});
+
+function renderCurrentLine() {
+  const idx = taps.length;
+  if (idx >= lines.length) {
+    currentLineEl.textContent = '✅ כל השורות סונכרנו!';
+    nextLineEl.textContent = '';
+    tapBtn.disabled = true;
+    finishSync();
+    return;
+  }
+  tapBtn.disabled = false;
+  currentLineEl.textContent = lines[idx].text;
+  nextLineEl.textContent = lines[idx + 1] ? ('הבא: ' + lines[idx + 1].text) : '';
+  statusEl.textContent = `שורה ${idx + 1} / ${lines.length}  |  זמן נוכחי: ${fmt(player.currentTime)}`;
+}
+
+function fmt(t) {
+  t = Math.max(0, t);
+  const m = Math.floor(t / 60);
+  const s = (t % 60).toFixed(2).padStart(5, '0');
+  return `${m}:${s}`;
+}
+
+startSyncBtn.addEventListener('click', () => {
+  if (!lines.length) { alert('טענו קודם את השורות'); return; }
+  player.currentTime = 0;
+  player.playbackRate = parseFloat(rateSelect.value);
+  player.play();
+  taps = [];
+  renderCurrentLine();
+});
+
+rateSelect.addEventListener('change', () => { player.playbackRate = parseFloat(rateSelect.value); });
+
+pauseBtn.addEventListener('click', () => {
+  if (player.paused) player.play(); else player.pause();
+});
+
+function doTap() {
+  if (taps.length >= lines.length) return;
+  const offset = parseFloat(offsetInput.value) || 0;
+  const t = Math.max(0, player.currentTime + offset);
+  taps.push(t);
+  renderCurrentLine();
+}
+
+function doUndo() {
+  if (taps.length > 0) {
+    taps.pop();
+    renderCurrentLine();
+  }
+}
+
+tapBtn.addEventListener('click', doTap);
+undoBtn.addEventListener('click', doUndo);
+
+document.addEventListener('keydown', (e) => {
+  if (syncPanel.style.display === 'none') return;
+  if (e.code === 'Space') { e.preventDefault(); doTap(); }
+  else if (e.code === 'Backspace') { e.preventDefault(); doUndo(); }
+});
+
+// live status update while playing
+setInterval(() => {
+  if (!player.paused && taps.length < lines.length) {
+    const idx = taps.length;
+    statusEl.textContent = `שורה ${idx + 1} / ${lines.length}  |  זמן נוכחי: ${fmt(player.currentTime)}`;
+  }
+}, 100);
+
+function finishSync() {
+  player.pause();
+  tablePanel.style.display = 'block';
+  linesTableBody.innerHTML = '';
+  const rows = buildRows();
+  rows.forEach((r, i) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${i + 1}</td><td>${fmt(r.start)}</td><td>${fmt(r.end)}</td><td>${r.text}</td>`;
+    linesTableBody.appendChild(tr);
+  });
+}
+
+function buildRows() {
+  const rows = [];
+  for (let i = 0; i < lines.length; i++) {
+    const start = taps[i];
+    const end = (i + 1 < lines.length && taps[i + 1] !== undefined) ? taps[i + 1] : (audioDuration || start + 3);
+    rows.push({ text: lines[i].text, start, end });
+  }
+  return rows;
+}
+
+function download(filename, content, mime) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+document.getElementById('export-json').addEventListener('click', () => {
+  const rows = buildRows();
+  const data = {
+    audio_file: audioFileName,
+    duration: audioDuration || null,
+    lines: rows.map(r => ({ start: +r.start.toFixed(3), end: +r.end.toFixed(3), text: r.text }))
+  };
+  download('karaoke_timing.json', JSON.stringify(data, null, 2), 'application/json');
+});
+
+document.getElementById('export-lrc').addEventListener('click', () => {
+  const rows = buildRows();
+  const lrcLines = rows.map(r => {
+    const m = Math.floor(r.start / 60);
+    const s = (r.start % 60).toFixed(2).padStart(5, '0');
+    return `[${String(m).padStart(2, '0')}:${s}]${r.text}`;
+  });
+  download('karaoke.lrc', lrcLines.join('\n'), 'text/plain');
+});
+</script>
+</body>
+</html>
